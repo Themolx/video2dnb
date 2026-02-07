@@ -13,11 +13,13 @@ Usage:
 
 Keys (when video window is focused):
     q / ESC  — quit
-    SPACE    — toggle pause
+    1-9      — switch camera (device index)
+    f        — load video file (prints prompt in terminal)
     +/-      — adjust BPM
     s        — toggle spectral texture
     d        — toggle drums
     v        — toggle video display
+    r        — toggle recording to WAV
 """
 
 import cv2
@@ -381,16 +383,28 @@ class DnBEngine:
 
 # ─── Video Thread ────────────────────────────────────────────────────────────
 
-def video_thread_func(source, vis_params, engine, show_video, stop_event):
-    """Capture and analyze video frames in a loop."""
+def open_source(source):
+    """Open a video source (file path or camera index). Returns (cap, is_file, fps)."""
     if isinstance(source, str) and os.path.exists(source):
         cap = cv2.VideoCapture(source)
         is_file = True
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        print(f"  📹 Opened video file: {os.path.basename(source)} ({fps:.0f}fps)")
     else:
-        cap = cv2.VideoCapture(int(source) if str(source).isdigit() else 0)
+        idx = int(source) if str(source).isdigit() else 0
+        cap = cv2.VideoCapture(idx)
         is_file = False
         fps = 30
+        if cap.isOpened():
+            print(f"  📷 Opened camera {idx}")
+        else:
+            print(f"  ❌ Cannot open camera {idx}")
+    return cap, is_file, fps
+
+
+def video_thread_func(source, vis_params, engine, show_video, stop_event, switch_request):
+    """Capture and analyze video frames in a loop. Supports live source switching."""
+    cap, is_file, fps = open_source(source)
     
     if not cap.isOpened():
         print(f"Error: cannot open video source: {source}")
@@ -399,59 +413,112 @@ def video_thread_func(source, vis_params, engine, show_video, stop_event):
     
     frame_delay = 1.0 / fps
     prev_gray = None
+    video_display_ok = True  # track if cv2.imshow works
     
     while not stop_event.is_set():
         t_start = time.time()
         
+        # Check for source switch request
+        if switch_request[0] is not None:
+            new_source = switch_request[0]
+            switch_request[0] = None
+            cap.release()
+            prev_gray = None
+            cap, is_file, fps = open_source(new_source)
+            frame_delay = 1.0 / fps
+            if not cap.isOpened():
+                print(f"  ❌ Failed to open: {new_source}, trying camera 0...")
+                cap, is_file, fps = open_source('0')
+            continue
+        
         ret, frame = cap.read()
         if not ret:
             if is_file:
-                # Loop video
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
             else:
-                break
+                time.sleep(0.1)
+                continue
         
         prev_gray = vis_params.update(frame, prev_gray)
         engine.update_params(vis_params.snapshot())
         
-        if show_video[0]:
-            # Draw HUD overlay
-            display = frame.copy()
-            h, dw = display.shape[:2]
-            
-            with vis_params.lock:
-                info = [
-                    f"BPM: {engine.bpm}",
-                    f"Brightness: {vis_params.brightness:.2f}",
-                    f"Motion: {vis_params.motion_norm:.2f}",
-                    f"Edges: {vis_params.edge_density:.2f}",
-                    f"Drums: {'ON' if engine.drums_on else 'OFF'}",
-                    f"Spectral: {'ON' if engine.spectral_on else 'OFF'}",
-                ]
-                if engine.recording:
-                    info.append("REC ●")
-            
-            for i, txt in enumerate(info):
-                cv2.putText(display, txt, (10, 25+i*22), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
-            
-            # Draw column profile as bar chart
-            col = vis_params.col_profile
-            bar_w = dw // len(col)
-            for i, v in enumerate(col):
-                x = i * bar_w
-                bh = int(v * 40)
-                cv2.rectangle(display, (x, h-bh), (x+bar_w-1, h), (0,255,0), -1)
-            
-            cv2.imshow("video2dnb realtime", display)
+        if show_video[0] and video_display_ok:
+            try:
+                display = frame.copy()
+                h, dw = display.shape[:2]
+                
+                with vis_params.lock:
+                    src_name = "Camera" if not is_file else "File"
+                    info = [
+                        f"SRC: {src_name} | BPM: {engine.bpm}",
+                        f"Bright: {vis_params.brightness:.2f}  Motion: {vis_params.motion_norm:.2f}",
+                        f"Edges: {vis_params.edge_density:.2f}  Sat: {vis_params.saturation:.2f}",
+                        f"R:{vis_params.red:.2f} G:{vis_params.green:.2f} B:{vis_params.blue:.2f}",
+                        f"Drums: {'ON' if engine.drums_on else 'OFF'}  Spectral: {'ON' if engine.spectral_on else 'OFF'}",
+                    ]
+                    if engine.recording:
+                        info.append("● REC")
+                
+                # Dark overlay for text readability
+                overlay = display.copy()
+                cv2.rectangle(overlay, (0, 0), (320, 18 + len(info)*20), (0,0,0), -1)
+                cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
+                
+                for i, txt in enumerate(info):
+                    cv2.putText(display, txt, (8, 18+i*20), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
+                
+                # Column profile rhythm bars at bottom
+                col = vis_params.col_profile
+                bar_w = max(1, dw // len(col))
+                for i, v in enumerate(col):
+                    x = i * bar_w
+                    bh = int(v * 50)
+                    color = (0, int(v*255), int((1-v)*255))
+                    cv2.rectangle(display, (x, h-bh), (x+bar_w-1, h), color, -1)
+                
+                # Row profile spectral bars on right side
+                row = vis_params.row_profile
+                bar_h = max(1, h // len(row))
+                for i, v in enumerate(row):
+                    y = i * bar_h
+                    bw = int(v * 40)
+                    cv2.rectangle(display, (dw-bw, y), (dw, y+bar_h-1), (int(v*200),100,255), -1)
+                
+                cv2.imshow("video2dnb realtime", display)
+            except Exception as e:
+                print(f"  ⚠️  Video display error: {e}")
+                print(f"  Disabling video display. Audio continues.")
+                video_display_ok = False
         
-        key = cv2.waitKey(1) & 0xFF
+        # Key handling — use cv2.waitKey even without display for timing
+        try:
+            key = cv2.waitKey(1) & 0xFF
+        except:
+            key = 255
+            time.sleep(frame_delay)
+        
         if key == ord('q') or key == 27:
             stop_event.set()
             break
-        elif key == ord(' '):
-            pass  # could toggle pause
+        elif key in range(ord('1'), ord('9')+1):
+            cam_idx = key - ord('0')
+            print(f"  Switching to camera {cam_idx}...")
+            switch_request[0] = str(cam_idx)
+        elif key == ord('0'):
+            print(f"  Switching to camera 0...")
+            switch_request[0] = '0'
+        elif key == ord('f'):
+            print("  Enter video file path (in terminal):")
+            try:
+                path = input("  > ").strip()
+                if os.path.exists(path):
+                    switch_request[0] = path
+                else:
+                    print(f"  ❌ File not found: {path}")
+            except:
+                pass
         elif key == ord('+') or key == ord('='):
             engine.bpm = min(300, engine.bpm + 5)
             print(f"  BPM: {engine.bpm}")
@@ -467,15 +534,18 @@ def video_thread_func(source, vis_params, engine, show_video, stop_event):
         elif key == ord('v'):
             show_video[0] = not show_video[0]
             if not show_video[0]:
-                cv2.destroyAllWindows()
+                try: cv2.destroyAllWindows()
+                except: pass
+            else:
+                video_display_ok = True  # re-enable
         elif key == ord('r'):
             if engine.recording:
                 engine.recording = False
-                print("  Recording stopped")
+                print("  ⏹ Recording stopped")
             else:
                 engine.recorded_frames = []
                 engine.recording = True
-                print("  Recording started...")
+                print("  ● Recording started...")
         
         # Maintain frame rate
         elapsed = time.time() - t_start
@@ -484,7 +554,8 @@ def video_thread_func(source, vis_params, engine, show_video, stop_event):
             time.sleep(sleep_time)
     
     cap.release()
-    cv2.destroyAllWindows()
+    try: cv2.destroyAllWindows()
+    except: pass
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -510,12 +581,14 @@ def main():
     print(f"  Audio: {SR}Hz, block={BLOCK_SIZE}")
     print("=" * 60)
     print("\nControls:")
-    print("  q/ESC  quit")
-    print("  +/-    BPM up/down")
-    print("  d      toggle drums")
-    print("  s      toggle spectral")
-    print("  v      toggle video")
-    print("  r      toggle recording")
+    print("  q/ESC    quit")
+    print("  0-9      switch camera")
+    print("  f        load video file")
+    print("  +/-      BPM up/down")
+    print("  d        toggle drums")
+    print("  s        toggle spectral")
+    print("  v        toggle video display")
+    print("  r        toggle recording")
     print()
     
     vis_params = VisualParams()
@@ -528,10 +601,11 @@ def main():
     
     stop_event = threading.Event()
     show_video = [not args.no_video]
+    switch_request = [None]  # mutable container for source switch requests
     
-    # Audio callback
+    # Audio callback (runs on its own thread via sounddevice)
     def audio_callback(outdata, frames, time_info, status):
-        if status:
+        if status and 'underflow' not in str(status).lower():
             print(f"Audio status: {status}")
         try:
             block = engine.render_block(frames)
@@ -556,21 +630,14 @@ def main():
         print(sd.query_devices())
         sys.exit(1)
     
-    # Start video thread
-    vid_thread = threading.Thread(
-        target=video_thread_func,
-        args=(args.source, vis_params, engine, show_video, stop_event),
-        daemon=True
-    )
-    
     print("Starting audio engine...")
     stream.start()
     print("Starting video capture...")
-    vid_thread.start()
     print("🎵 LIVE! Press q to quit.\n")
     
+    # Run video on MAIN THREAD (required by macOS for cv2.imshow)
     try:
-        vid_thread.join()
+        video_thread_func(args.source, vis_params, engine, show_video, stop_event, switch_request)
     except KeyboardInterrupt:
         print("\nStopping...")
         stop_event.set()
