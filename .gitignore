@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+*.wav
+*.mp4
+.DS_Store
+render-wav/node_modules/
+render-wav/package-lock.json
